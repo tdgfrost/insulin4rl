@@ -74,7 +74,7 @@ def update_plots(current_idx, iters, losses, aurocs=None, v_s0=None):
     ax_loss.set_title(f"Model Losses")
     ax_loss.set_xlabel("Epoch")
     ax_loss.grid(True, alpha=0.3)
-    ax_loss.legend()
+    ax_loss.legend(loc='upper left')
 
     if aurocs is not None:
         ax_auroc = axes[plot_idx]
@@ -121,16 +121,25 @@ def update_plots(current_idx, iters, losses, aurocs=None, v_s0=None):
         if isinstance(v_s0, dict):
             for v_name, v_values in v_s0.items():
                 linestyle = '-' if 'train' in v_name.lower() else '--'
-                ax_v.plot(iters, v_values, label=v_name, linewidth=1.5, linestyle=linestyle)
+
+                # Check if v_values is a scalar and plot a horizontal line if true
+                if isinstance(v_values, (int, float)):
+                    ax_v.axhline(y=v_values, label=v_name, linewidth=1.5, linestyle=linestyle)
+                else:
+                    ax_v.plot(iters, v_values, label=v_name, linewidth=1.5, linestyle=linestyle)
         else:
-            ax_v.plot(iters, v_s0, label='$V(S_0)$', color='tab:green', linewidth=1.5)
+            # Also handle the case where the naked v_s0 is passed as a scalar
+            if isinstance(v_s0, (int, float)):
+                ax_v.axhline(y=v_s0, label='$V(S_0)$', color='tab:green', linewidth=1.5)
+            else:
+                ax_v.plot(iters, v_s0, label='$V(S_0)$', color='tab:green', linewidth=1.5)
 
         # Rename the title as requested
         ax_v.set_title("Predicted $V(S_0)$")
         ax_v.set_xlabel("Epoch")
         ax_v.set_ylabel("Predicted Value")
         ax_v.grid(True, alpha=0.3)
-        ax_v.legend()
+        ax_v.legend(loc='upper left')
 
     plt.tight_layout()
     plt.show()
