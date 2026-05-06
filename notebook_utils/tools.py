@@ -120,7 +120,7 @@ def update_plots(current_idx, iters, losses, aurocs=None, v_s0=None):
         ax_v = axes[plot_idx]
         if isinstance(v_s0, dict):
             for v_name, v_values in v_s0.items():
-                linestyle = '-' if 'train' in v_name.lower() else '--'
+                linestyle = '--' if 'train' in v_name.lower() else '-'
 
                 # Check if v_values is a scalar and plot a horizontal line if true
                 if isinstance(v_values, (int, float)):
