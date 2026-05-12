@@ -1,4 +1,14 @@
-This is the change log for Insulin4RL v1.0.0
+This is the change log for Insulin4RL v1.0.1
+
+=================
+Insulin4RL v1.0.1
+=================
+
+Changes:
+- Notebook updated to have distribution of time between states and distribution of delta_change doses
+- Notebook updated to plot UMAP embedding after behavioural-cloning
+- Notebook updated to just a single ExampleTrainingDataset
+- Notebook updated to have implicit Q-learning (both SMDP and MDP)
 
 =================
 Insulin4RL v1.0.0

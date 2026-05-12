@@ -62,7 +62,7 @@ def update_plots(current_idx, iters, losses, aurocs=None, v_s0=None):
 
     if isinstance(losses, dict):
         for loss_name, loss_values in losses.items():
-            linestyle = '--' if 'val' in loss_name.lower() else '-'
+            linestyle = '-' if 'train' in loss_name.lower() else '--'
             ax_loss.plot(iters, loss_values, label=loss_name, linewidth=1.5, linestyle=linestyle)
         ax_loss.set_ylabel("Loss Magnitude")
     else:
@@ -71,38 +71,75 @@ def update_plots(current_idx, iters, losses, aurocs=None, v_s0=None):
 
     # Set logarithmic scale for the loss plot
     ax_loss.set_yscale('log')
-    ax_loss.set_title(f"Model Loss (Epoch {current_idx})")
+    ax_loss.set_title(f"Model Losses")
     ax_loss.set_xlabel("Epoch")
     ax_loss.grid(True, alpha=0.3)
-    ax_loss.legend()
+    ax_loss.legend(loc='upper left')
 
     if aurocs is not None:
         ax_auroc = axes[plot_idx]
+        ax_mae = ax_auroc.twinx()  # Create the secondary y-axis
         plot_idx += 1
-        for action_id, scores in aurocs.items():
-            linestyle = '--' if 'val' in action_id.lower() else '-'
-            ax_auroc.plot(iters, scores, label=action_id, linestyle=linestyle)
-        ax_auroc.set_title("Action-wise AUROC")
+
+        lines = []
+        labels = []
+
+        for metric_name, scores in aurocs.items():
+            linestyle = '-' if 'train' in metric_name.lower() else '--'
+
+            # Route MAE to the secondary axis
+            if 'MAE' in metric_name:
+                line = ax_mae.plot(iters, scores, label=metric_name, linestyle=linestyle, linewidth=2)
+                ax_mae.set_ylabel("Mean Absolute Error (MAE)")
+            else:
+                line = ax_auroc.plot(iters, scores, label=metric_name, linestyle=linestyle)
+
+            # Collect handles for a unified legend
+            lines.extend(line)
+            labels.append(metric_name)
+
+        ax_auroc.set_title("Validation Metrics")
         ax_auroc.set_xlabel("Epoch")
-        ax_auroc.set_ylabel("Score")
+        ax_auroc.set_ylabel("AUROC Score")
+        ax_auroc.set_ylim(0.5, 1.0)
+        ax_mae.set_ylim(0.0, 1.5)
         ax_auroc.grid(True, alpha=0.3)
-        ax_auroc.legend()
+
+        # Combine legends from both axes
+        # We attach the legend to ax_mae because it is the top-most layer
+        leg = ax_mae.legend(lines, labels, loc='upper left')
+
+        # Set zorder to a high value to force it to the front
+        leg.set_zorder(100)
+
+        # Ensure the legend background is opaque so lines don't show through
+        leg.get_frame().set_alpha(1.0)
+        leg.get_frame().set_facecolor('white')
 
     if v_s0 is not None:
         ax_v = axes[plot_idx]
         if isinstance(v_s0, dict):
             for v_name, v_values in v_s0.items():
-                linestyle = '--' if 'val' in v_name.lower() else '-'
-                ax_v.plot(iters, v_values, label=v_name, linewidth=1.5, linestyle=linestyle)
+                linestyle = '--' if 'train' in v_name.lower() else '-'
+
+                # Check if v_values is a scalar and plot a horizontal line if true
+                if isinstance(v_values, (int, float)):
+                    ax_v.axhline(y=v_values, label=v_name, linewidth=1.5, linestyle=linestyle)
+                else:
+                    ax_v.plot(iters, v_values, label=v_name, linewidth=1.5, linestyle=linestyle)
         else:
-            ax_v.plot(iters, v_s0, label='$V(S_0)$', color='tab:green', linewidth=1.5)
+            # Also handle the case where the naked v_s0 is passed as a scalar
+            if isinstance(v_s0, (int, float)):
+                ax_v.axhline(y=v_s0, label='$V(S_0)$', color='tab:green', linewidth=1.5)
+            else:
+                ax_v.plot(iters, v_s0, label='$V(S_0)$', color='tab:green', linewidth=1.5)
 
         # Rename the title as requested
         ax_v.set_title("Predicted $V(S_0)$")
         ax_v.set_xlabel("Epoch")
         ax_v.set_ylabel("Predicted Value")
         ax_v.grid(True, alpha=0.3)
-        ax_v.legend()
+        ax_v.legend(loc='upper left')
 
     plt.tight_layout()
     plt.show()

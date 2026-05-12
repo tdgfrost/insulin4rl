@@ -101,17 +101,16 @@ class _BaseDataset:
         raise NotImplementedError("Subclasses must implement __getitem__")
 
 
-
-class ExampleDataset(_BaseDataset):
+class ExampleTrainingDataset(_BaseDataset):
     def __init__(self, segment_dir: str, device: str = 'cuda'):
         super().__init__(segment_dir, device)
 
     def _precompute(self):
         self.states = self._concat_states()
-        self.actions = self._concat_actions()
-        self.reward_markers = self._concat_reward_markers()
         self.next_states = self._concat_states(is_next=True)
+        self.actions = self._concat_actions()
         self.next_actions = self._concat_actions(is_next=True)
+        self.reward_markers = self._concat_reward_markers()
         self.infos = self._concat_infos()
         self.dones = self.raw_data['dones']['is_done']
 
@@ -123,46 +122,5 @@ class ExampleDataset(_BaseDataset):
             'next_states': self.next_states[idx],
             'next_actions': self.next_actions[idx],
             'dones': self.dones[idx],
-            'infos': self.infos[idx],
-        }
-
-
-class CloningDataset(_BaseDataset):
-    def __init__(self, segment_dir: str, device: str = 'cuda'):
-        super().__init__(segment_dir, device)
-
-    def _precompute(self):
-        self.states = self._concat_states()
-        self.actions = self._concat_actions(override_keys=['insulin_maintain', 'insulin_stop', 'insulin_change'])
-
-    def __getitem__(self, idx) -> Dict[str, torch.Tensor]:
-        return {
-            'states': self.states[idx],
-            'actions': self.actions[idx],
-        }
-
-
-class FQEDataset(_BaseDataset):
-    def __init__(self, segment_dir: str, device: str = 'cuda'):
-        super().__init__(segment_dir, device)
-
-    def _precompute(self):
-        self.states = self._concat_states()
-        self.actions = self._concat_actions(override_keys=['insulin_maintain', 'insulin_stop', 'insulin_change'])
-        self.reward_markers = self._concat_reward_markers(override_keys=['next_bm'])
-        # The overrides above are permanent and will carry across to the next states/actions
-        self.next_states = self._concat_states(is_next=True)
-        self.next_actions = self._concat_actions(is_next=True)
-        self.infos = self._concat_infos(override_keys=['time_until_next_bm'])
-        self.dones = self.raw_data['dones']['is_done']
-
-    def __getitem__(self, idx) -> Dict[str, torch.Tensor]:
-        return {
-            'states': self.states[idx],
-            'actions': self.actions[idx],
-            'reward_markers': self.reward_markers[idx],
-            'next_states': self.next_states[idx],
-            'next_actions': self.next_actions[idx],
-            'dones': self.dones[idx],
-            'infos': {'time_until_next_bm': self.infos[idx]},
+            'infos': {key: self.infos[idx, i] for i, key in enumerate(self.info_keys)},
         }
