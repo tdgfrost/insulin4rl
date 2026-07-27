@@ -2,6 +2,7 @@ from IPython import display
 import matplotlib.pyplot as plt
 from dataclasses import dataclass
 from typing import Any, Optional, Dict, List, Sequence, Union, Iterable
+import glob
 import os
 import random
 import numpy as np
@@ -17,6 +18,9 @@ class Batch:
     next_actions: Optional[torch.Tensor] = None
     dones: Optional[torch.Tensor] = None
     infos: Optional[Dict[str, Union[torch.Tensor, Dict[str, torch.Tensor]]]] = None
+    # Row indices of this batch within the dataset, for looking up anything that
+    # has been precomputed for the whole split (e.g. frozen policy actions).
+    idx: Optional[torch.Tensor] = None
 
 
 class DataLoader:
@@ -339,7 +343,8 @@ class ResultsStore:
                     self.meta[name] = data[key]
                 else:
                     self.runs.setdefault(owner, {})[name] = data[key]
-        print(f'[results] {self.path}: {len(self.run_ids)} completed run(s) loaded.')
+        if self.enabled:
+            print(f'[results] {self.path}: {len(self.run_ids)} completed run(s) loaded.')
 
     def has(self, run_id: str) -> bool:
         return run_id in self.runs
@@ -369,10 +374,50 @@ class ResultsStore:
         for name, values in self.meta.items():
             payload[f'meta|{name}'] = values
 
-        os.makedirs(os.path.dirname(os.path.abspath(self.path)), exist_ok=True)
-        tmp_path = f'{self.path}.tmp.npz'
+        directory = os.path.dirname(os.path.abspath(self.path))
+        os.makedirs(directory, exist_ok=True)
+        # Dot-prefixed, so a temporary file left behind by a crash is not picked
+        # up by the shard glob below.
+        tmp_path = os.path.join(directory, f'.{os.path.basename(self.path)}.tmp.npz')
         np.savez(tmp_path, **payload)
         os.replace(tmp_path, self.path)
+
+
+def completed_run_ids(pattern: str) -> set:
+    """
+    Every run id already recorded in any store matching `pattern`. Used so that
+    parallel workers (and relaunches) never redo a run another worker finished.
+    """
+    ids = set()
+    for path in sorted(glob.glob(pattern)):
+        ids.update(ResultsStore(path, enabled=False).run_ids)
+    return ids
+
+
+def merge_result_shards(pattern: str, out_path: str) -> ResultsStore:
+    """
+    Combine the per-worker result files written by a parallel sweep into a
+    single store. Runs are keyed by id, so re-merging is idempotent. If only one
+    file matches there is nothing to merge and it is returned directly.
+    """
+    sources = [path for path in sorted(glob.glob(pattern))
+               if os.path.abspath(path) != os.path.abspath(out_path)]
+    if not sources:
+        raise FileNotFoundError(f'No FQE result files matched {pattern!r}. Has the sweep been run?')
+    if len(sources) == 1:
+        return ResultsStore(sources[0])
+
+    merged = ResultsStore(out_path)
+    for path in sources:
+        shard = ResultsStore(path, enabled=False)
+        merged.meta.update(shard.meta)
+        for run_id in shard.run_ids:
+            if run_id not in merged.runs:
+                merged.run_ids.append(run_id)
+            merged.runs[run_id] = shard.runs[run_id]
+    merged.flush()
+    print(f'[results] merged {len(sources)} shard(s) -> {out_path} ({len(merged.run_ids)} run(s)).')
+    return merged
 
 
 # =============================================================================
