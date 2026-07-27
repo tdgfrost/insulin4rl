@@ -1,7 +1,10 @@
 from IPython import display
 import matplotlib.pyplot as plt
 from dataclasses import dataclass
-from typing import Any, Optional, Dict, Union, Iterable
+from typing import Any, Optional, Dict, List, Sequence, Union, Iterable
+import os
+import random
+import numpy as np
 import torch
 
 
@@ -45,7 +48,7 @@ class DataLoader:
         return (self.n + self.batch_size - 1) // self.batch_size
 
 
-def update_plots(current_idx, iters, losses, aurocs=None, v_s0=None):
+def update_plots(current_idx, iters, losses, aurocs=None, v_s0=None, title=None):
     display.clear_output(wait=True)
     n_plots = 1
     if aurocs is not None:
@@ -141,5 +144,298 @@ def update_plots(current_idx, iters, losses, aurocs=None, v_s0=None):
         ax_v.grid(True, alpha=0.3)
         ax_v.legend(loc='upper left')
 
+    if title is not None:
+        fig.suptitle(title)
+
     plt.tight_layout()
     plt.show()
+
+
+# =============================================================================
+#   MULTI-SEED HELPERS
+# =============================================================================
+def set_seed(seed: Optional[int]):
+    """
+    Seed every RNG that affects training. A seed of `None` is a no-op, which
+    keeps the single-run (default) workflow byte-for-byte as it was before.
+    """
+    if seed is None:
+        return
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)  # also seeds the MPS generator
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+
+
+def run_tag(**seeds: Optional[int]) -> str:
+    """
+    Build a filename suffix from the seeds identifying a run, skipping any that
+    are `None`. `run_tag(seed=None)` -> '' (i.e. the original filenames are
+    preserved when multi-seed mode is off), `run_tag(p=0, f=3)` -> '_p0_f3'.
+    """
+    parts = [f'{name}{value}' for name, value in seeds.items() if value is not None]
+    return ('_' + '_'.join(parts)) if parts else ''
+
+
+# =============================================================================
+#   CRASH-SAFE CHECKPOINTING
+# =============================================================================
+def _atomic_torch_save(obj: Any, path: str):
+    """Write via a temporary file so an interrupted save cannot corrupt `path`."""
+    directory = os.path.dirname(os.path.abspath(path))
+    os.makedirs(directory, exist_ok=True)
+    tmp_path = f'{path}.tmp'
+    torch.save(obj, tmp_path)
+    os.replace(tmp_path, path)
+
+
+def _get_rng_state() -> Dict[str, Any]:
+    state = {
+        'python': random.getstate(),
+        'numpy': np.random.get_state(),
+        'torch': torch.get_rng_state(),
+    }
+    if torch.cuda.is_available():
+        state['cuda'] = torch.cuda.get_rng_state_all()
+    if torch.backends.mps.is_available():
+        state['mps'] = torch.mps.get_rng_state()
+    return state
+
+
+def _set_rng_state(state: Optional[Dict[str, Any]]):
+    if not state:
+        return
+    random.setstate(state['python'])
+    np.random.set_state(state['numpy'])
+    torch.set_rng_state(state['torch'])
+    if 'cuda' in state and torch.cuda.is_available():
+        torch.cuda.set_rng_state_all(state['cuda'])
+    if 'mps' in state and torch.backends.mps.is_available():
+        torch.mps.set_rng_state(state['mps'])
+
+
+class Checkpoint:
+    """
+    Epoch-level checkpointing, so that an interrupted training run resumes from
+    the last completed epoch instead of starting again from scratch.
+
+    `history` is a dict of the *live* Python lists the training loop appends its
+    metrics to. They are saved after every epoch and refilled in place on
+    resume, so the body of the training loop does not need to change.
+
+    Usage:
+        ckpt = Checkpoint(path, models={'policy': model},
+                          optimizers={'policy': optimizer},
+                          history={'train_loss_history': train_loss_history})
+        for epoch in range(ckpt.resume(), EPOCHS):
+            ...
+            ckpt.save(epoch + 1)
+        ckpt.finalise('./saved_models/model.pt', model.state_dict())
+    """
+
+    def __init__(
+            self,
+            path: str,
+            models: Optional[Dict[str, torch.nn.Module]] = None,
+            optimizers: Optional[Dict[str, torch.optim.Optimizer]] = None,
+            history: Optional[Dict[str, list]] = None,
+            enabled: bool = True,
+    ):
+        self.path = path
+        self.models = models or {}
+        self.optimizers = optimizers or {}
+        self.history = history or {}
+        self.enabled = enabled
+        self.next_epoch = 0
+        self.completed = False
+
+    def resume(self) -> int:
+        """Restore any saved state and return the epoch index to start from."""
+        if not self.enabled or not os.path.exists(self.path):
+            return 0
+
+        # weights_only=False because we also store the RNG states, which are not
+        # plain tensors. These are our own files, written by `save()` below.
+        ckpt = torch.load(self.path, map_location='cpu', weights_only=False)
+
+        for name, values in ckpt.get('history', {}).items():
+            if name in self.history:
+                self.history[name][:] = list(values)
+
+        for name, model in self.models.items():
+            model.load_state_dict(ckpt['models'][name])
+        for name, optimizer in self.optimizers.items():
+            optimizer.load_state_dict(ckpt['optimizers'][name])
+        _set_rng_state(ckpt.get('rng'))
+
+        self.next_epoch = int(ckpt.get('next_epoch', 0))
+        self.completed = bool(ckpt.get('completed', False))
+
+        if self.completed:
+            print(f'[skip] {self.path}: already complete.')
+        else:
+            print(f'[resume] {self.path}: continuing from epoch {self.next_epoch + 1}.')
+        return self.next_epoch
+
+    def save(self, next_epoch: int):
+        """Call at the end of every epoch, passing the *next* epoch index."""
+        if not self.enabled:
+            return
+        _atomic_torch_save({
+            'next_epoch': int(next_epoch),
+            'completed': False,
+            'models': {name: model.state_dict() for name, model in self.models.items()},
+            'optimizers': {name: opt.state_dict() for name, opt in self.optimizers.items()},
+            'history': {name: list(values) for name, values in self.history.items()},
+            'rng': _get_rng_state(),
+        }, self.path)
+        self.next_epoch = int(next_epoch)
+
+    def finalise(self, final_path: Optional[str] = None, payload: Any = None):
+        """Save the run's final artefact and mark the checkpoint as complete."""
+        if final_path is not None:
+            _atomic_torch_save(payload, final_path)
+        if self.enabled:
+            _atomic_torch_save({
+                'next_epoch': self.next_epoch,
+                'completed': True,
+                'models': {name: model.state_dict() for name, model in self.models.items()},
+                'optimizers': {name: opt.state_dict() for name, opt in self.optimizers.items()},
+                'history': {name: list(values) for name, values in self.history.items()},
+                'rng': _get_rng_state(),
+            }, self.path)
+        self.completed = True
+
+
+class ResultsStore:
+    """
+    Crash-safe store for the per-run result curves used to build the final
+    figure (e.g. V(S_0) at every epoch, for every run). It is rewritten
+    atomically after each completed run, so an interrupted sweep resumes with
+    the runs that already finished.
+    """
+
+    def __init__(self, path: str, enabled: bool = True):
+        self.path = path
+        self.enabled = enabled
+        self.run_ids: List[str] = []
+        self.runs: Dict[str, Dict[str, np.ndarray]] = {}
+        self.meta: Dict[str, np.ndarray] = {}
+        self.load()
+
+    def load(self):
+        if not os.path.exists(self.path):
+            return
+        with np.load(self.path, allow_pickle=False) as data:
+            self.run_ids = [str(run_id) for run_id in data['__run_ids__']]
+            self.runs = {run_id: {} for run_id in self.run_ids}
+            self.meta = {}
+            for key in data.files:
+                if key == '__run_ids__':
+                    continue
+                owner, _, name = key.partition('|')
+                if owner == 'meta':
+                    self.meta[name] = data[key]
+                else:
+                    self.runs.setdefault(owner, {})[name] = data[key]
+        print(f'[results] {self.path}: {len(self.run_ids)} completed run(s) loaded.')
+
+    def has(self, run_id: str) -> bool:
+        return run_id in self.runs
+
+    def add(self, run_id: str, **curves):
+        """Record (or overwrite) one run's curves and flush to disk immediately."""
+        if run_id not in self.runs:
+            self.run_ids.append(run_id)
+        self.runs[run_id] = {k: np.asarray(v, dtype=np.float64) for k, v in curves.items()}
+        self.flush()
+
+    def set_meta(self, **values):
+        self.meta.update({k: np.asarray(v, dtype=np.float64) for k, v in values.items()})
+        self.flush()
+
+    def stack(self, name: str) -> np.ndarray:
+        """Curves for `name` across every completed run, shaped (n_runs, n_epochs)."""
+        return np.stack([self.runs[run_id][name] for run_id in self.run_ids])
+
+    def flush(self):
+        if not self.enabled:
+            return
+        payload = {'__run_ids__': np.array(self.run_ids, dtype='<U64')}
+        for run_id in self.run_ids:
+            for name, values in self.runs[run_id].items():
+                payload[f'{run_id}|{name}'] = values
+        for name, values in self.meta.items():
+            payload[f'meta|{name}'] = values
+
+        os.makedirs(os.path.dirname(os.path.abspath(self.path)), exist_ok=True)
+        tmp_path = f'{self.path}.tmp.npz'
+        np.savez(tmp_path, **payload)
+        os.replace(tmp_path, self.path)
+
+
+# =============================================================================
+#   AGGREGATION (Agarwal et al., 2021 - "Deep RL at the Edge of the
+#   Statistical Precipice", NeurIPS 2021)
+# =============================================================================
+def iqm(scores: Union[np.ndarray, Sequence[float]], axis: int = 0) -> np.ndarray:
+    """
+    Interquartile mean: the mean of the middle 50% of the runs. This matches
+    `scipy.stats.trim_mean(scores, proportiontocut=0.25)`, but is implemented
+    here with numpy alone to avoid adding a dependency, and is vectorised so it
+    can be applied to many bootstrap replicates at once.
+    """
+    scores = np.sort(np.asarray(scores, dtype=np.float64), axis=axis)
+    n_runs = scores.shape[axis]
+    lower_cut = int(0.25 * n_runs)
+    upper_cut = n_runs - lower_cut
+    trimmed = np.take(scores, np.arange(lower_cut, upper_cut), axis=axis)
+    return trimmed.mean(axis=axis)
+
+
+def bootstrap_iqm_ci(
+        runs: Union[np.ndarray, Sequence[float]],
+        n_bootstrap: int = 10_000,
+        alpha: float = 0.05,
+        seed: int = 0,
+        chunk_size: int = 1_000,
+):
+    """
+    Percentile bootstrap confidence interval for the interquartile mean.
+
+    Runs are resampled with replacement `n_bootstrap` times; the IQM of each
+    replicate is computed, and the [alpha/2, 1 - alpha/2] percentiles of those
+    replicates give the interval (Agarwal et al., 2021, Section 4.1 - they find
+    percentile CIs give the best coverage).
+
+    `runs` is either a 1-D array of per-run scores, or a 2-D array of per-run
+    *curves* shaped (n_runs, n_epochs). In the 2-D case whole curves are
+    resampled together, which gives the same pointwise interval at each epoch
+    but a visibly smoother band.
+
+    Returns (point_estimate, lower, upper).
+    """
+    runs = np.asarray(runs, dtype=np.float64)
+    is_scalar = runs.ndim == 1
+    if is_scalar:
+        runs = runs[:, None]
+
+    n_runs = runs.shape[0]
+    rng = np.random.default_rng(seed)
+
+    replicates = []
+    remaining = n_bootstrap
+    while remaining > 0:
+        batch = min(chunk_size, remaining)
+        indices = rng.integers(0, n_runs, size=(batch, n_runs))
+        replicates.append(iqm(runs[indices], axis=1))
+        remaining -= batch
+    replicates = np.concatenate(replicates, axis=0)
+
+    lower, upper = np.percentile(replicates, [100 * alpha / 2, 100 * (1 - alpha / 2)], axis=0)
+    point = iqm(runs, axis=0)
+
+    if is_scalar:
+        return float(point[0]), float(lower[0]), float(upper[0])
+    return point, lower, upper
